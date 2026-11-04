@@ -1,0 +1,1030 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Contador de Huevos</title>
+<style>
+  /* Minimo: imagenes/video no se desbordan en el movil, dialog visible */
+  img, video, canvas { max-width: 100%; height: auto; }
+  dialog { width: 96%; max-width: 1100px; box-sizing: border-box; }
+  /* Layout horizontal para comparar antes/después */
+  .par-fotos { display: flex; flex-wrap: wrap; gap: 8px; }
+  .par-fotos > figure { flex: 1 1 280px; margin: 0; min-width: 0; }
+  .par-fotos img { display: block; width: 100%; }
+  .info-comparacion { background: #f4f4f4; padding: 4px 8px; font-size: 14px; }
+  .delta-mas { color: #1a7a1a; font-weight: bold; }
+  .delta-menos { color: #a40000; font-weight: bold; }
+  .delta-cero { color: #555; }
+  .cubeta-nueva { background: #fff4cc; padding: 6px 10px; border-left: 4px solid #d4a000; margin: 6px 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Contador de Huevos</h1>
+</header>
+
+<section>
+  <h2>1. Modelo</h2>
+  <p id="modelo-estado">No hay modelo cargado. Selecciona un archivo <code>.onnx</code>.</p>
+  <input type="file" id="modelo-input" accept=".onnx">
+  <p>
+    <label>Umbral de confianza: <input type="range" id="umbral-input" min="0.1" max="0.9" step="0.05" value="0.3"></label>
+    <span id="umbral-valor">0.30</span>
+  </p>
+  <p>
+    <label>Clase a contar (vacío = todas): <input type="number" id="clase-input" min="0" style="width:60px" placeholder="*"></label>
+    <small id="clases-info"></small>
+  </p>
+</section>
+
+<section>
+  <h2>2. Resumen del día</h2>
+  <p>Total acumulado: <strong id="total-dia">0</strong> huevos</p>
+  <p id="ultima-ronda">Aún no hay rondas.</p>
+</section>
+
+<section id="camara-section" hidden>
+  <video id="video" autoplay playsinline muted></video>
+  <p><button id="cerrar-camara-btn" type="button">Cerrar cámara</button></p>
+</section>
+
+<section>
+  <h2>3. Tomar fotos</h2>
+  <p>
+    <button id="contar-btn" type="button" disabled>Contar huevos (cámara)</button>
+  </p>
+  <p>O cargar fotos ya tomadas desde una carpeta:</p>
+  <input type="file" id="carpeta-input" webkitdirectory multiple accept="image/*">
+  <p id="estado" hidden></p>
+</section>
+
+<section>
+  <h2>4. Rondas</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Hora</th>
+        <th>Total</th>
+        <th>Diferencia</th>
+        <th>Nota</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="rondas"><tr><td colspan="6">Sin rondas todavía.</td></tr></tbody>
+  </table>
+  <p><button id="reiniciar-btn" type="button">Reiniciar día</button></p>
+</section>
+
+<dialog id="detalle">
+  <h3>Ronda <span id="d-num"></span></h3>
+  <p><strong>Hora:</strong> <span id="d-hora"></span></p>
+  <p><strong>Total:</strong> <span id="d-total"></span> huevos · <strong>Diferencia:</strong> <span id="d-diff"></span></p>
+  <div id="d-cubeta-nueva" class="cubeta-nueva" hidden></div>
+  <div class="info-comparacion" id="d-info"></div>
+  <h4>Comparación: Antes (izquierda) → Después (derecha)</h4>
+  <div class="par-fotos">
+    <figure>
+      <figcaption><strong>Antes</strong></figcaption>
+      <img id="d-antes" alt="Foto de la ronda anterior">
+      <figcaption id="d-antes-info"></figcaption>
+    </figure>
+    <figure>
+      <figcaption><strong>Después</strong></figcaption>
+      <img id="d-despues" alt="Foto actual con detecciones marcadas">
+      <figcaption id="d-despues-info"></figcaption>
+    </figure>
+  </div>
+  <p id="d-antes-vacio"><em>Primera ronda del día. Cubeta vacía al inicio.</em></p>
+  <p>
+    <button id="d-repetir" type="button">Repetir foto</button>
+    <button id="d-eliminar" type="button">Eliminar ronda</button>
+    <button id="d-cerrar" type="button">Cerrar</button>
+  </p>
+</dialog>
+
+<footer>
+  <hr>
+</footer>
+
+<script src="ort.min.js"></script>
+<script>
+(function() {
+  'use strict';
+
+  var UMBRAL_CONFIANZA = 0.3;     // se puede cambiar desde la UI
+  var UMBRAL_IOU = 0.45;
+  var IMG_SIZE = 640;
+  var DB_NAME = 'contador-huevos';
+  var DB_VERSION = 1;
+  var ORT_CDN = './';
+
+  var COCO_NAMES = [
+    'persona','bicicleta','auto','moto','avion','autobus','tren','camion','barco','sem rojo',
+    'sem amarillo','hidrante','pare','parquimetro','banca','pajaro','gato','perro','caballo','oveja',
+    'vaca','elefante','oso','cebra','jirafa','mochila','paraguas','bolso','corbata','maleta',
+    'frisbee','skis','snowboard','pelota','cometa','bat beisbol','guante beisbol','skate','surf','raqueta',
+    'botella','copa vino','taza','tenedor','cuchillo','cuchara','tazon','banana','manzana','sanguche',
+    'naranja','brocoli','zanahoria','hot dog','pizza','rosquilla','pastel','silla','sofa','planta',
+    'cama','mesa','inodoro','tv','laptop','raton','control','teclado','celular','microondas',
+    'horno','tostadora','lavabo','nevera','libro','reloj','florero','tijeras','oso peluche','secador',
+    'cepillo dental'
+  ];
+
+  var ortSession = null;
+  var videoStream = null;
+  var currentDay = null;
+  var activeRoundId = null;
+
+  function openDB() {
+    return new Promise(function(resolve, reject) {
+      var req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = function(e) {
+        var db = e.target.result;
+        if (!db.objectStoreNames.contains('days')) {
+          db.createObjectStore('days', { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains('model')) {
+          db.createObjectStore('model', { keyPath: 'id' });
+        }
+      };
+      req.onsuccess = function() { resolve(req.result); };
+      req.onerror = function() { reject(req.error); };
+    });
+  }
+
+  function idbGet(store, key) {
+    return openDB().then(function(db) {
+      return new Promise(function(resolve, reject) {
+        var tx = db.transaction(store, 'readonly');
+        var req = tx.objectStore(store).get(key);
+        req.onsuccess = function() { resolve(req.result); };
+        req.onerror = function() { reject(req.error); };
+      });
+    });
+  }
+
+  function idbPut(store, value) {
+    return openDB().then(function(db) {
+      return new Promise(function(resolve, reject) {
+        var tx = db.transaction(store, 'readwrite');
+        tx.objectStore(store).put(value);
+        tx.oncomplete = function() { resolve(); };
+        tx.onerror = function() { reject(tx.error); };
+      });
+    });
+  }
+
+  function idbGetAll(store) {
+    return openDB().then(function(db) {
+      return new Promise(function(resolve, reject) {
+        var tx = db.transaction(store, 'readonly');
+        var req = tx.objectStore(store).getAll();
+        req.onsuccess = function() { resolve(req.result); };
+        req.onerror = function() { reject(req.error); };
+      });
+    });
+  }
+
+  function configureORT() {
+    if (typeof ort === 'undefined') {
+      throw new Error('No se pudo cargar ONNX Runtime Web. Verifica que ort.min.js este en la misma carpeta que index.html.');
+    }
+    ort.env.wasm.wasmPaths = ORT_CDN;
+    ort.env.wasm.numThreads = 1;
+    ort.env.wasm.simd = true;
+  }
+
+  function loadModelFromArrayBuffer(buffer) {
+    configureORT();
+    return ort.InferenceSession.create(buffer, {
+      executionProviders: ['wasm'],
+      graphOptimizationLevel: 'all'
+    }).then(function(session) {
+      ortSession = session;
+      return session;
+    });
+  }
+
+  // Pre-procesamiento: imagen -> tensor [1, 3, 640, 640] normalizado
+  function preprocess(canvas) {
+    var inputCanvas = document.createElement('canvas');
+    inputCanvas.width = IMG_SIZE;
+    inputCanvas.height = IMG_SIZE;
+    var ctx = inputCanvas.getContext('2d');
+    var scale = Math.min(IMG_SIZE / canvas.width, IMG_SIZE / canvas.height);
+    var newW = canvas.width * scale;
+    var newH = canvas.height * scale;
+    var offsetX = (IMG_SIZE - newW) / 2;
+    var offsetY = (IMG_SIZE - newH) / 2;
+    ctx.fillStyle = '#808080';
+    ctx.fillRect(0, 0, IMG_SIZE, IMG_SIZE);
+    ctx.drawImage(canvas, offsetX, offsetY, newW, newH);
+
+    var imageData = ctx.getImageData(0, 0, IMG_SIZE, IMG_SIZE);
+    var data = imageData.data;
+    var pixelCount = IMG_SIZE * IMG_SIZE;
+    var tensorData = new Float32Array(3 * pixelCount);
+    for (var i = 0; i < pixelCount; i++) {
+      var src = i * 4;
+      tensorData[i] = data[src] / 255;
+      tensorData[pixelCount + i] = data[src + 1] / 255;
+      tensorData[2 * pixelCount + i] = data[src + 2] / 255;
+    }
+    return {
+      tensor: new ort.Tensor('float32', tensorData, [1, 3, IMG_SIZE, IMG_SIZE]),
+      scale: scale,
+      offsetX: offsetX,
+      offsetY: offsetY
+    };
+  }
+
+  function runInference(canvas) {
+    var pre = preprocess(canvas);
+    var inputName = ortSession.inputNames[0];
+    var feeds = {};
+    feeds[inputName] = pre.tensor;
+    return ortSession.run(feeds).then(function(outputs) {
+      // Tomar la primera salida
+      var outputName = ortSession.outputNames[0];
+      var output = outputs[outputName];
+      return postProcessYOLO(output, pre.scale, pre.offsetX, pre.offsetY, canvas.width, canvas.height);
+    });
+  }
+
+  // Post-procesamiento YOLO. Soporta multiples formatos.
+  function postProcessYOLO(output, scale, offsetX, offsetY, origW, origH) {
+    var dims = output.dims;
+    var data = output.data;
+
+    // Caso 1: salida con NMS, formato [1, num_det, 6] donde 6 = [x1,y1,x2,y2,conf,class]
+    if (dims.length === 3 && dims[0] === 1 && dims[2] === 6 && dims[1] > 0 && dims[1] < 1000) {
+      return processNMSOutput(data, dims[1], scale, offsetX, offsetY, false);
+    }
+    // Caso 2: salida con NMS, formato [1, 6, num_det]
+    if (dims.length === 3 && dims[0] === 1 && dims[1] === 6 && dims[2] > 0 && dims[2] < 1000) {
+      return processNMSOutput(data, dims[2], scale, offsetX, offsetY, true);
+    }
+    // Caso 3: salida con NMS, formato [1, num_det, 7] (con score por clase)
+    if (dims.length === 3 && dims[0] === 1 && dims[2] === 7 && dims[1] > 0 && dims[1] < 1000) {
+      return processNMSOutput(data, dims[1], scale, offsetX, offsetY, false, 7);
+    }
+    // Caso 4: salida sin NMS, formato Ultralytics [1, 4+nc, num_boxes]
+    if (dims.length === 3 && dims[0] === 1) {
+      var numBoxes, numClasses, layoutCF;
+      if (dims[1] < dims[2]) {
+        numClasses = dims[1] - 4;
+        numBoxes = dims[2];
+        layoutCF = true;
+      } else {
+        numBoxes = dims[1];
+        numClasses = dims[2] - 4;
+        layoutCF = false;
+      }
+      return processRawOutput(data, numBoxes, numClasses, layoutCF, scale, offsetX, offsetY);
+    }
+    // Caso 5: salida 2D [num_boxes, 4+nc]
+    if (dims.length === 2) {
+      var nb = dims[0];
+      var ncl = dims[1] - 4;
+      return processRawOutput(data, nb, ncl, false, scale, offsetX, offsetY);
+    }
+
+    throw new Error('Formato de salida del modelo no reconocido: ' + JSON.stringify(dims));
+  }
+
+  function processNMSOutput(data, count, scale, offsetX, offsetY, channelsFirst, stride) {
+    stride = stride || 6;
+    var detections = [];
+    for (var i = 0; i < count; i++) {
+      var x1, y1, x2, y2, conf, cls;
+      if (channelsFirst) {
+        x1 = data[i];
+        y1 = data[count + i];
+        x2 = data[2 * count + i];
+        y2 = data[3 * count + i];
+        conf = data[4 * count + i];
+        cls = data[5 * count + i];
+      } else {
+        var base = i * stride;
+        x1 = data[base];
+        y1 = data[base + 1];
+        x2 = data[base + 2];
+        y2 = data[base + 3];
+        conf = data[base + 4];
+        cls = data[base + 5];
+      }
+      if (conf < UMBRAL_CONFIANZA) continue;
+      detections.push({
+        x1: (x1 - offsetX) / scale,
+        y1: (y1 - offsetY) / scale,
+        x2: (x2 - offsetX) / scale,
+        y2: (y2 - offsetY) / scale,
+        conf: conf,
+        class: Math.round(cls)
+      });
+    }
+    return { detections: detections, numClasses: 80 };
+  }
+
+  function processRawOutput(data, numBoxes, numClasses, channelsFirst, scale, offsetX, offsetY) {
+    var detections = [];
+    var i, c;
+    for (i = 0; i < numBoxes; i++) {
+      var cx, cy, w, h;
+      if (channelsFirst) {
+        cx = data[i];
+        cy = data[numBoxes + i];
+        w = data[2 * numBoxes + i];
+        h = data[3 * numBoxes + i];
+      } else {
+        var stride = 4 + numClasses;
+        cx = data[i * stride];
+        cy = data[i * stride + 1];
+        w = data[i * stride + 2];
+        h = data[i * stride + 3];
+      }
+      var maxConf = 0;
+      var bestClass = -1;
+      for (c = 0; c < numClasses; c++) {
+        var conf;
+        if (channelsFirst) {
+          conf = data[(4 + c) * numBoxes + i];
+        } else {
+          conf = data[i * (4 + numClasses) + 4 + c];
+        }
+        if (conf > maxConf) {
+          maxConf = conf;
+          bestClass = c;
+        }
+      }
+      if (maxConf < UMBRAL_CONFIANZA) continue;
+
+      var x1 = (cx - w / 2 - offsetX) / scale;
+      var y1 = (cy - h / 2 - offsetY) / scale;
+      var x2 = (cx + w / 2 - offsetX) / scale;
+      var y2 = (cy + h / 2 - offsetY) / scale;
+
+      detections.push({
+        x1: x1, y1: y1, x2: x2, y2: y2,
+        conf: maxConf, class: bestClass
+      });
+    }
+    var kept = nms(detections, UMBRAL_IOU);
+    return { detections: kept, numClasses: numClasses };
+  }
+
+  function iou(a, b) {
+    var xx1 = Math.max(a.x1, b.x1);
+    var yy1 = Math.max(a.y1, b.y1);
+    var xx2 = Math.min(a.x2, b.x2);
+    var yy2 = Math.min(a.y2, b.y2);
+    var w = Math.max(0, xx2 - xx1);
+    var h = Math.max(0, yy2 - yy1);
+    var inter = w * h;
+    var areaA = (a.x2 - a.x1) * (a.y2 - a.y1);
+    var areaB = (b.x2 - b.x1) * (b.y2 - b.y1);
+    return inter / (areaA + areaB - inter);
+  }
+
+  function nms(detections, threshold) {
+    var sorted = detections.slice().sort(function(a, b) { return b.conf - a.conf; });
+    var kept = [];
+    var suppressed = {};
+    for (var i = 0; i < sorted.length; i++) {
+      if (suppressed[i]) continue;
+      kept.push(sorted[i]);
+      for (var j = i + 1; j < sorted.length; j++) {
+        if (suppressed[j]) continue;
+        if (iou(sorted[i], sorted[j]) > threshold) {
+          suppressed[j] = true;
+        }
+      }
+    }
+    return kept;
+  }
+
+  function filterByClass(detections) {
+    var claseInput = document.getElementById('clase-input');
+    var claseStr = claseInput.value.trim();
+    if (claseStr === '') return detections;
+    var claseNum = parseInt(claseStr, 10);
+    if (isNaN(claseNum)) return detections;
+    return detections.filter(function(d) { return d.class === claseNum; });
+  }
+
+  function className(cls) {
+    if (cls >= 0 && cls < COCO_NAMES.length) return COCO_NAMES[cls];
+    return 'clase ' + cls;
+  }
+
+  function startCamera() {
+    if (videoStream) return Promise.resolve();
+    var estado = document.getElementById('estado');
+    estado.hidden = false;
+    estado.textContent = 'Pidiendo permiso de cámara...';
+    return navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false
+    }).then(function(stream) {
+      videoStream = stream;
+      var video = document.getElementById('video');
+      video.srcObject = stream;
+      document.getElementById('camara-section').hidden = false;
+      return new Promise(function(resolve) {
+        if (video.readyState >= 2) return resolve();
+        video.onloadeddata = function() { resolve(); };
+      });
+    }).then(function() {
+      return new Promise(function(r) { setTimeout(r, 800); });
+    });
+  }
+
+  function stopCamera() {
+    if (videoStream) {
+      videoStream.getTracks().forEach(function(t) { t.stop(); });
+      videoStream = null;
+      document.getElementById('camara-section').hidden = true;
+    }
+  }
+
+  function capturePhoto() {
+    var video = document.getElementById('video');
+    var canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    var ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    return canvas;
+  }
+
+  function loadImageToCanvas(img, cb) {
+    // Reescalar para que no sea demasiado grande (max 1280px lado)
+    var maxSide = 1280;
+    var scale = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
+    var canvas = document.createElement('canvas');
+    canvas.width = Math.round(img.naturalWidth * scale);
+    canvas.height = Math.round(img.naturalHeight * scale);
+    var ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    cb(canvas);
+  }
+
+  function drawDetections(canvas, detections) {
+    var ctx = canvas.getContext('2d');
+    ctx.lineWidth = Math.max(2, Math.round(canvas.width / 200));
+    ctx.font = 'bold ' + Math.max(12, Math.round(canvas.width / 50)) + 'px sans-serif';
+    var colors = ['#0066ff', '#00aa44', '#aa0000', '#aa6600', '#6600aa', '#00aaaa'];
+    for (var i = 0; i < detections.length; i++) {
+      var det = detections[i];
+      var x = Math.max(0, det.x1);
+      var y = Math.max(0, det.y1);
+      var w = Math.min(canvas.width, det.x2) - x;
+      var h = Math.min(canvas.height, det.y2) - y;
+      ctx.strokeStyle = colors[det.class % colors.length];
+      ctx.fillStyle = colors[det.class % colors.length];
+      ctx.strokeRect(x, y, w, h);
+      var label = (i + 1) + '. ' + className(det.class) + ' ' + Math.round(det.conf * 100) + '%';
+      var labelW = ctx.measureText(label).width + 8;
+      var labelH = Math.max(14, Math.round(canvas.width / 50)) + 4;
+      ctx.fillRect(x, Math.max(0, y - labelH), labelW, labelH);
+      ctx.fillStyle = '#fff';
+      ctx.fillText(label, x + 4, Math.max(labelH - 4, y - 4));
+    }
+  }
+
+  function canvasToDataURL(canvas) {
+    return canvas.toDataURL('image/jpeg', 0.7);
+  }
+
+  function handleCount() {
+    var btn = document.getElementById('contar-btn');
+    var estado = document.getElementById('estado');
+    btn.disabled = true;
+    estado.hidden = false;
+
+    startCamera()
+      .then(function() {
+        estado.textContent = 'Capturando foto...';
+        return capturePhoto();
+      })
+      .then(function(canvas) {
+        estado.textContent = 'Detectando huevos (esto puede tardar unos segundos)...';
+        return runInference(canvas).then(function(result) {
+          return { canvas: canvas, detections: result.detections };
+        });
+      })
+      .then(function(obj) {
+        var filtered = filterByClass(obj.detections);
+        drawDetections(obj.canvas, filtered);
+        return addRound(obj.canvas, filtered);
+      })
+      .catch(function(e) {
+        alert('Error al contar: ' + (e && e.message ? e.message : e));
+        console.error(e);
+      })
+      .then(function() {
+        btn.disabled = false;
+        estado.hidden = true;
+      });
+  }
+
+  function handleFolder(files) {
+    if (!ortSession) {
+      alert('Primero carga un modelo .onnx en la sección 1.');
+      return;
+    }
+    var btn = document.getElementById('contar-btn');
+    var estado = document.getElementById('estado');
+    btn.disabled = true;
+    estado.hidden = false;
+
+    // Filtrar solo imagenes y ordenar por nombre
+    var imgs = [];
+    for (var i = 0; i < files.length; i++) {
+      if (files[i].type.indexOf('image/') === 0) imgs.push(files[i]);
+    }
+    if (imgs.length === 0) {
+      estado.textContent = 'No se encontraron imágenes en la carpeta.';
+      btn.disabled = false;
+      return;
+    }
+    imgs.sort(function(a, b) {
+      return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+    });
+
+    estado.textContent = 'Procesando ' + imgs.length + ' imágenes...';
+
+    var queue = imgs.slice();
+    var processed = 0;
+
+    function processNext() {
+      if (queue.length === 0) {
+        estado.hidden = true;
+        btn.disabled = false;
+        if (currentDay && currentDay.rounds.length > 0) {
+          showDetail(currentDay.rounds[currentDay.rounds.length - 1].id);
+        }
+        return;
+      }
+      var file = queue.shift();
+      processed++;
+      estado.textContent = 'Procesando ' + processed + '/' + imgs.length + ': ' + file.name;
+      var reader = new FileReader();
+      reader.onload = function() {
+        var img = new Image();
+        img.onload = function() {
+          loadImageToCanvas(img, function(canvas) {
+            runInference(canvas).then(function(result) {
+              var filtered = filterByClass(result.detections);
+              drawDetections(canvas, filtered);
+              return addRound(canvas, filtered, file.name);
+            }).then(function() {
+              setTimeout(processNext, 30);
+            }).catch(function(e) {
+              console.error('Error en imagen', file.name, e);
+              setTimeout(processNext, 30);
+            });
+          });
+        };
+        img.onerror = function() {
+          console.error('No se pudo cargar', file.name);
+          setTimeout(processNext, 30);
+        };
+        img.src = reader.result;
+      };
+      reader.onerror = function() { setTimeout(processNext, 30); };
+      reader.readAsDataURL(file);
+    }
+
+    processNext();
+  }
+
+  function addRound(canvas, detections, sourceName) {
+    var photoData = canvasToDataURL(canvas);
+    var total = detections.length;
+    var prevTotal = (currentDay && currentDay.rounds.length > 0)
+      ? currentDay.rounds[currentDay.rounds.length - 1].total
+      : 0;
+    var diff = total - prevTotal;
+    var isFirstOfDay = (!currentDay || currentDay.rounds.length === 0);
+
+    // Caso especial: cubeta nueva encima (cubeta anterior tenia huevos y ahora esta vacia, no es primera del dia)
+    var note = '';
+    var isCubetaNueva = false;
+    if (isFirstOfDay && total === 0) {
+      note = 'Inicio del día (cubeta vacía)';
+    } else if (!isFirstOfDay && prevTotal > 0 && total === 0) {
+      note = 'Cubeta nueva encima (anterior tapada)';
+      isCubetaNueva = true;
+    } else if (diff > 0) {
+      note = '+' + diff + ' huevos';
+    } else if (diff < 0) {
+      note = diff + ' huevos (disminución)';
+    } else {
+      note = 'Sin cambios';
+    }
+
+    if (!currentDay) {
+      currentDay = { id: 'day-' + Date.now(), startedAt: new Date().toISOString(), rounds: [] };
+    }
+    var round = {
+      id: Date.now() + Math.floor(Math.random() * 1000),
+      number: currentDay.rounds.length + 1,
+      time: new Date().toISOString(),
+      total: total,
+      diff: diff,
+      photo: photoData,
+      prevPhoto: (currentDay.rounds.length > 0) ? currentDay.rounds[currentDay.rounds.length - 1].photo : null,
+      prevTotal: prevTotal,
+      note: note,
+      isCubetaNueva: isCubetaNueva,
+      source: sourceName || null,
+      detClasses: countByClass(detections)
+    };
+    currentDay.rounds.push(round);
+    return idbPut('days', currentDay).then(function() {
+      renderHistory();
+      renderSummary();
+    });
+  }
+
+  function countByClass(detections) {
+    var counts = {};
+    detections.forEach(function(d) {
+      var key = d.class;
+      counts[key] = (counts[key] || 0) + 1;
+    });
+    return counts;
+  }
+
+  function retakePhoto() {
+    if (!activeRoundId) return;
+    var round = findRound(activeRoundId);
+    if (!round) return;
+    var btn = document.getElementById('d-repetir');
+    btn.disabled = true;
+    btn.textContent = 'Procesando...';
+
+    startCamera()
+      .then(function() {
+        return capturePhoto();
+      })
+      .then(function(canvas) {
+        return runInference(canvas).then(function(result) {
+          return { canvas: canvas, detections: filterByClass(result.detections) };
+        });
+      })
+      .then(function(obj) {
+        drawDetections(obj.canvas, obj.detections);
+        return updateRoundPhoto(round, obj.canvas, obj.detections);
+      })
+      .catch(function(e) {
+        alert('Error al repetir: ' + (e && e.message ? e.message : e));
+        console.error(e);
+      })
+      .then(function() {
+        btn.disabled = false;
+        btn.textContent = 'Repetir foto';
+      });
+  }
+
+  function updateRoundPhoto(round, canvas, detections) {
+    var photoData = canvasToDataURL(canvas);
+    var newTotal = detections.length;
+    var idx = currentDay.rounds.indexOf(round);
+    var prevTotal = (idx > 0) ? currentDay.rounds[idx - 1].total : 0;
+    var diff = newTotal - prevTotal;
+
+    round.photo = photoData;
+    round.total = newTotal;
+    round.diff = diff;
+    round.detClasses = countByClass(detections);
+
+    var isFirst = (idx === 0);
+    if (isFirst && newTotal === 0) {
+      round.note = 'Inicio del día (cubeta vacía)';
+      round.isCubetaNueva = false;
+    } else if (!isFirst && prevTotal > 0 && newTotal === 0) {
+      round.note = 'Cubeta nueva encima (anterior tapada)';
+      round.isCubetaNueva = true;
+    } else if (diff > 0) {
+      round.note = '+' + diff + ' huevos';
+      round.isCubetaNueva = false;
+    } else if (diff < 0) {
+      round.note = diff + ' huevos (disminución)';
+      round.isCubetaNueva = false;
+    } else {
+      round.note = 'Sin cambios';
+      round.isCubetaNueva = false;
+    }
+
+    // Recalcular siguiente si existe
+    if (idx < currentDay.rounds.length - 1) {
+      var next = currentDay.rounds[idx + 1];
+      next.prevPhoto = photoData;
+      next.prevTotal = newTotal;
+      var nextDiff = next.total - newTotal;
+      next.diff = nextDiff;
+      if (newTotal > 0 && next.total === 0) {
+        next.note = 'Cubeta nueva encima (anterior tapada)';
+        next.isCubetaNueva = true;
+      } else if (nextDiff > 0) {
+        next.note = '+' + nextDiff + ' huevos';
+        next.isCubetaNueva = false;
+      } else if (nextDiff < 0) {
+        next.note = nextDiff + ' huevos (disminución)';
+        next.isCubetaNueva = false;
+      } else {
+        next.note = 'Sin cambios';
+        next.isCubetaNueva = false;
+      }
+    }
+    return idbPut('days', currentDay).then(function() {
+      renderHistory();
+      renderSummary();
+      showDetail(round.id);
+    });
+  }
+
+  function deleteRound() {
+    if (!activeRoundId) return;
+    var round = findRound(activeRoundId);
+    if (!round) return;
+    if (!confirm('¿Eliminar la ronda #' + round.number + '? Se recalculan las diferencias de las siguientes.')) return;
+    var idx = currentDay.rounds.indexOf(round);
+    currentDay.rounds.splice(idx, 1);
+    // Renumerar y recalcular diffs
+    currentDay.rounds.forEach(function(r, i) {
+      r.number = i + 1;
+      var prevTotal = (i > 0) ? currentDay.rounds[i - 1].total : 0;
+      r.prevTotal = prevTotal;
+      r.prevPhoto = (i > 0) ? currentDay.rounds[i - 1].photo : null;
+      var diff = r.total - prevTotal;
+      r.diff = diff;
+      if (i === 0 && r.total === 0) {
+        r.note = 'Inicio del día (cubeta vacía)';
+        r.isCubetaNueva = false;
+      } else if (i > 0 && prevTotal > 0 && r.total === 0) {
+        r.note = 'Cubeta nueva encima (anterior tapada)';
+        r.isCubetaNueva = true;
+      } else if (diff > 0) {
+        r.note = '+' + diff + ' huevos';
+        r.isCubetaNueva = false;
+      } else if (diff < 0) {
+        r.note = diff + ' huevos (disminución)';
+        r.isCubetaNueva = false;
+      } else {
+        r.note = 'Sin cambios';
+        r.isCubetaNueva = false;
+      }
+    });
+    return idbPut('days', currentDay).then(function() {
+      closeDetail();
+      renderHistory();
+      renderSummary();
+    });
+  }
+
+  function findRound(id) {
+    if (!currentDay) return null;
+    for (var i = 0; i < currentDay.rounds.length; i++) {
+      if (currentDay.rounds[i].id === id) return currentDay.rounds[i];
+    }
+    return null;
+  }
+
+  function showDetail(roundId) {
+    var round = findRound(roundId);
+    if (!round) return;
+    activeRoundId = roundId;
+    document.getElementById('d-num').textContent = round.number;
+    document.getElementById('d-hora').textContent = formatTime(round.time) +
+      (round.source ? ' (' + round.source + ')' : '');
+    document.getElementById('d-total').textContent = round.total;
+    document.getElementById('d-diff').innerHTML = formatDiff(round.diff);
+
+    var cubetaDiv = document.getElementById('d-cubeta-nueva');
+    if (round.isCubetaNueva) {
+      cubetaDiv.hidden = false;
+      cubetaDiv.textContent = 'Cubeta nueva encima: la cubeta anterior (' + round.prevTotal +
+        ' huevos) quedó tapada por una cubeta vacía.';
+    } else {
+      cubetaDiv.hidden = true;
+    }
+
+    var imgAntes = document.getElementById('d-antes');
+    var vacioMsg = document.getElementById('d-antes-vacio');
+    if (round.prevPhoto) {
+      imgAntes.src = round.prevPhoto;
+      imgAntes.hidden = false;
+      vacioMsg.hidden = true;
+    } else {
+      imgAntes.hidden = true;
+      imgAntes.removeAttribute('src');
+      vacioMsg.hidden = false;
+    }
+    document.getElementById('d-despues').src = round.photo;
+
+    document.getElementById('d-antes-info').innerHTML = round.prevTotal !== null && round.prevTotal !== undefined
+      ? 'Antes: ' + round.prevTotal + ' huevos'
+      : 'Antes: — (primera ronda)';
+    document.getElementById('d-despues-info').innerHTML = 'Después: ' + round.total + ' huevos';
+
+    // Info de comparacion
+    var info = document.getElementById('d-info');
+    var html = '<strong>Diferencia:</strong> ' + formatDiff(round.diff) + ' &nbsp;|&nbsp; ';
+    if (round.detClasses) {
+      var classesStr = Object.keys(round.detClasses).map(function(k) {
+        return className(parseInt(k, 10)) + ': ' + round.detClasses[k];
+      }).join(', ');
+      html += '<strong>Detecciones:</strong> ' + (classesStr || 'ninguna');
+    }
+    if (round.prevTotal !== undefined) {
+      var pct = round.prevTotal > 0
+        ? Math.round((round.diff / round.prevTotal) * 100)
+        : (round.diff > 0 ? 100 : 0);
+      html += ' &nbsp;|&nbsp; <strong>Cambio:</strong> ' + (pct >= 0 ? '+' : '') + pct + '%';
+    }
+    info.innerHTML = html;
+
+    var dialog = document.getElementById('detalle');
+    if (!dialog.open) {
+      if (typeof dialog.showModal === 'function') {
+        dialog.showModal();
+      } else {
+        dialog.setAttribute('open', 'open');
+      }
+    }
+  }
+
+  function closeDetail() {
+    var dialog = document.getElementById('detalle');
+    if (typeof dialog.close === 'function') {
+      dialog.close();
+    } else {
+      dialog.removeAttribute('open');
+    }
+    activeRoundId = null;
+  }
+
+  function formatDiff(diff) {
+    if (diff > 0) return '<span class="delta-mas">+' + diff + '</span>';
+    if (diff < 0) return '<span class="delta-menos">' + diff + '</span>';
+    return '<span class="delta-cero">±0</span>';
+  }
+
+  function formatTime(iso) {
+    var d = new Date(iso);
+    var hh = String(d.getHours()).padStart(2, '0');
+    var mm = String(d.getMinutes()).padStart(2, '0');
+    return hh + ':' + mm;
+  }
+
+  function renderHistory() {
+    var tbody = document.getElementById('rondas');
+    tbody.innerHTML = '';
+    if (!currentDay || currentDay.rounds.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6">Sin rondas todavía.</td></tr>';
+      return;
+    }
+    currentDay.rounds.forEach(function(round) {
+      var tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td>' + round.number + '</td>' +
+        '<td>' + formatTime(round.time) + '</td>' +
+        '<td>' + round.total + '</td>' +
+        '<td>' + formatDiff(round.diff).replace(/<[^>]+>/g, '') + '</td>' +
+        '<td>' + (round.note || '') + '</td>' +
+        '<td><button type="button" class="ver-btn" data-id="' + round.id + '">Ver</button></td>';
+      tbody.appendChild(tr);
+    });
+    var btns = tbody.querySelectorAll('.ver-btn');
+    for (var i = 0; i < btns.length; i++) {
+      btns[i].addEventListener('click', function(e) {
+        showDetail(Number(e.target.getAttribute('data-id')));
+      });
+    }
+  }
+
+  function renderSummary() {
+    var total = (currentDay && currentDay.rounds.length > 0)
+      ? currentDay.rounds[currentDay.rounds.length - 1].total
+      : 0;
+    document.getElementById('total-dia').textContent = total;
+    var ultima = document.getElementById('ultima-ronda');
+    if (currentDay && currentDay.rounds.length > 0) {
+      var last = currentDay.rounds[currentDay.rounds.length - 1];
+      ultima.innerHTML = 'Última ronda #' + last.number + ' · ' + formatTime(last.time) +
+        ' · ' + last.total + ' huevos · ' + formatDiff(last.diff) + ' · ' + (last.note || '');
+    } else {
+      ultima.textContent = 'Aún no hay rondas.';
+    }
+  }
+
+  function reiniciarDia() {
+    if (!confirm('¿Reiniciar el día? Se archiva el historial actual y se empieza desde 0 huevos.')) return;
+    var promise;
+    if (currentDay) {
+      currentDay.archived = true;
+      currentDay.endedAt = new Date().toISOString();
+      promise = idbPut('days', currentDay);
+    } else {
+      promise = Promise.resolve();
+    }
+    promise.then(function() {
+      currentDay = null;
+      renderHistory();
+      renderSummary();
+    });
+  }
+
+  function init() {
+    configureORT();
+
+    idbGet('model', 'current').then(function(stored) {
+      if (stored && stored.data) {
+        var estado = document.getElementById('modelo-estado');
+        estado.textContent = 'Cargando modelo guardado...';
+        return loadModelFromArrayBuffer(stored.data).then(function() {
+          var mb = (stored.data.byteLength / 1024 / 1024).toFixed(2);
+          estado.textContent = 'Modelo cargado (' + mb + ' MB). Listo para contar.';
+          document.getElementById('contar-btn').disabled = false;
+        });
+      }
+      return null;
+    }).catch(function(e) {
+      console.warn('No se pudo cargar el modelo guardado:', e);
+    });
+
+    idbGetAll('days').then(function(allDays) {
+      var active = allDays.filter(function(d) { return !d.archived; })
+        .sort(function(a, b) {
+          return new Date(b.startedAt) - new Date(a.startedAt);
+        });
+      if (active.length > 0) {
+        currentDay = active[0];
+      }
+      renderHistory();
+      renderSummary();
+    }).catch(function(e) {
+      console.warn('No se pudo cargar el historial:', e);
+    });
+
+    document.getElementById('contar-btn').addEventListener('click', handleCount);
+    document.getElementById('cerrar-camara-btn').addEventListener('click', stopCamera);
+    document.getElementById('reiniciar-btn').addEventListener('click', reiniciarDia);
+    document.getElementById('d-cerrar').addEventListener('click', closeDetail);
+    document.getElementById('d-repetir').addEventListener('click', retakePhoto);
+    document.getElementById('d-eliminar').addEventListener('click', deleteRound);
+    document.getElementById('carpeta-input').addEventListener('change', function(e) {
+      handleFolder(e.target.files);
+    });
+
+    document.getElementById('umbral-input').addEventListener('input', function(e) {
+      UMBRAL_CONFIANZA = parseFloat(e.target.value);
+      document.getElementById('umbral-valor').textContent = UMBRAL_CONFIANZA.toFixed(2);
+    });
+
+    document.getElementById('modelo-input').addEventListener('change', function(e) {
+      var file = e.target.files[0];
+      if (!file) return;
+      var estado = document.getElementById('modelo-estado');
+      estado.textContent = 'Cargando modelo ' + file.name + '...';
+      var reader = new FileReader();
+      reader.onload = function() {
+        var buffer = reader.result;
+        loadModelFromArrayBuffer(buffer)
+          .then(function() {
+            return idbPut('model', { id: 'current', data: buffer });
+          })
+          .then(function() {
+            var mb = (buffer.byteLength / 1024 / 1024).toFixed(2);
+            estado.innerHTML = 'Modelo cargado: ' + file.name + ' (' + mb + ' MB).<br>' +
+              '<small>Si las detecciones son raras, lee el LEEME.md: el YOLO26n base está entrenado en COCO y NO incluye "huevo" como clase. Necesitas entrenar tu propio modelo con fotos de huevos.</small>';
+            document.getElementById('contar-btn').disabled = false;
+            document.getElementById('clases-info').textContent = ' (COCO tiene 80 clases; huevos no están incluidos)';
+          })
+          .catch(function(err) {
+            estado.textContent = 'Error al cargar el modelo: ' + (err && err.message ? err.message : err);
+            console.error(err);
+          });
+      };
+      reader.onerror = function() {
+        estado.textContent = 'No se pudo leer el archivo.';
+      };
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+</script>
+</body>
+</html>
